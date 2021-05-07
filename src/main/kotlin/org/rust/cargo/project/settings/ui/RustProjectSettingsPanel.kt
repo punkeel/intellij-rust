@@ -8,6 +8,9 @@ package org.rust.cargo.project.settings.ui
 import com.intellij.execution.process.ProcessAdapter
 import com.intellij.execution.process.ProcessEvent
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.application.AppUIExecutor
+import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.options.ConfigurationException
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.Task
@@ -16,15 +19,18 @@ import com.intellij.openapi.util.Key
 import com.intellij.ui.JBColor
 import com.intellij.ui.components.Link
 import com.intellij.ui.layout.LayoutBuilder
+import org.rust.cargo.project.RsToolchainPathChoosingComboBox
 import org.rust.cargo.project.settings.toolchain
 import org.rust.cargo.toolchain.RsToolchainBase
 import org.rust.cargo.toolchain.RsToolchainProvider
+import org.rust.cargo.toolchain.flavors.RsToolchainFlavor
 import org.rust.cargo.toolchain.tools.Rustup
 import org.rust.cargo.toolchain.tools.rustc
 import org.rust.cargo.toolchain.tools.rustup
 import org.rust.openapiext.UiDebouncer
 import org.rust.openapiext.pathToDirectoryTextField
 import java.awt.BorderLayout
+import java.awt.event.ItemEvent
 import java.nio.file.Path
 import java.nio.file.Paths
 import javax.swing.JComponent
@@ -44,8 +50,13 @@ class RustProjectSettingsPanel(
 
     private val versionUpdateDebouncer = UiDebouncer(this)
 
-    private val pathToToolchainField = pathToDirectoryTextField(this,
-        "Select directory with cargo binary") { update() }
+    private val pathToToolchainField = RsToolchainPathChoosingComboBox().apply {
+        childComponent.addItemListener { event ->
+            if (event.stateChange == ItemEvent.SELECTED) {
+                update()
+            }
+        }
+    }
 
     private val pathToStdlibField = pathToDirectoryTextField(this,
         "Select directory with standard library source code")
@@ -53,30 +64,29 @@ class RustProjectSettingsPanel(
     private var fetchedSysroot: String? = null
 
     private val downloadStdlibLink = Link("Download via Rustup") {
-        val rustup = RsToolchainProvider.getToolchain(Paths.get(pathToToolchainField.text))?.rustup
-        if (rustup != null) {
-            object : Task.Modal(null, "Downloading Rust Standard Library", true) {
-                override fun onSuccess() = update()
+        val homePath = pathToToolchainField.selectedPath ?: return@Link
+        val rustup = RsToolchainProvider.getToolchain(homePath)?.rustup ?: return@Link
+        object : Task.Modal(null, "Downloading Rust Standard Library", true) {
+            override fun onSuccess() = update()
 
-                override fun run(indicator: ProgressIndicator) {
-                    indicator.isIndeterminate = true
-                    indicator.text = "Installing using Rustup..."
+            override fun run(indicator: ProgressIndicator) {
+                indicator.isIndeterminate = true
+                indicator.text = "Installing using Rustup..."
 
-                    rustup.downloadStdlib(this@RustProjectSettingsPanel, listener = object : ProcessAdapter() {
-                        override fun onTextAvailable(event: ProcessEvent, outputType: Key<*>) {
-                            indicator.text2 = event.text.trim()
-                        }
-                    })
-                }
-            }.queue()
-        }
+                rustup.downloadStdlib(this@RustProjectSettingsPanel, listener = object : ProcessAdapter() {
+                    override fun onTextAvailable(event: ProcessEvent, outputType: Key<*>) {
+                        indicator.text2 = event.text.trim()
+                    }
+                })
+            }
+        }.queue()
     }.apply { isVisible = false }
 
     private val toolchainVersion = JLabel()
 
     var data: Data
         get() {
-            val toolchain = RsToolchainProvider.getToolchain(Paths.get(pathToToolchainField.text))
+            val toolchain = pathToToolchainField.selectedPath?.let { RsToolchainProvider.getToolchain(it) }
             return Data(
                 toolchain = toolchain,
                 explicitPathToStdlib = pathToStdlibField.text.blankToNull()
@@ -85,7 +95,7 @@ class RustProjectSettingsPanel(
         }
         set(value) {
             // https://youtrack.jetbrains.com/issue/KT-16367
-            pathToToolchainField.setText(value.toolchain?.location?.toString())
+            pathToToolchainField.selectedPath = value.toolchain?.location
             pathToStdlibField.text = value.explicitPathToStdlib ?: ""
             update()
         }
@@ -100,6 +110,10 @@ class RustProjectSettingsPanel(
         row("Toolchain version:") { toolchainVersion() }
         row("Standard library:") { wrapComponent(pathToStdlibField)(growX, pushX) }
         row("") { downloadStdlibLink() }
+
+        addToolchainsAsync(pathToToolchainField) {
+            RsToolchainFlavor.getApplicableFlavors().flatMap { it.suggestHomePaths() }.distinct()
+        }
     }
 
     @Throws(ConfigurationException::class)
@@ -111,10 +125,10 @@ class RustProjectSettingsPanel(
     }
 
     private fun update() {
-        val pathToToolchain = pathToToolchainField.text
+        val pathToToolchain = pathToToolchainField.selectedPath
         versionUpdateDebouncer.run(
             onPooledThread = {
-                val toolchain = RsToolchainProvider.getToolchain(Paths.get(pathToToolchain))
+                val toolchain = pathToToolchain?.let { RsToolchainProvider.getToolchain(it) }
                 val rustc = toolchain?.rustc()
                 val rustup = toolchain?.rustup
                 val rustcVersion = rustc?.queryVersion()?.semver
@@ -146,9 +160,35 @@ class RustProjectSettingsPanel(
     private val RsToolchainBase.rustup: Rustup? get() = rustup(cargoProjectDir)
 }
 
-private fun String.blankToNull(): String? = if (isBlank()) null else this
+private fun String.blankToNull(): String? = ifBlank { null }
 
 private fun wrapComponent(component: JComponent): JComponent =
     JPanel(BorderLayout()).apply {
         add(component, BorderLayout.NORTH)
     }
+
+/**
+ * Obtains a list of toolchains on a pool using [toolchainObtainer], then fills [toolchainComboBox] on the EDT.
+ */
+@Suppress("UnstableApiUsage")
+private fun addToolchainsAsync(
+    toolchainComboBox: RsToolchainPathChoosingComboBox,
+    toolchainObtainer: () -> List<Path>
+) {
+    ApplicationManager.getApplication().executeOnPooledThread {
+        val executor = AppUIExecutor.onUiThread(ModalityState.any())
+        executor.execute { toolchainComboBox.setBusy(true) }
+        var toolchains = emptyList<Path>()
+        try {
+            toolchains = toolchainObtainer()
+        } finally {
+            executor.execute {
+                toolchainComboBox.setBusy(false)
+                val selectedPath = toolchainComboBox.selectedPath
+                toolchainComboBox.childComponent.removeAllItems()
+                toolchains.forEach(toolchainComboBox.childComponent::addItem)
+                toolchainComboBox.selectedPath = selectedPath
+            }
+        }
+    }
+}
