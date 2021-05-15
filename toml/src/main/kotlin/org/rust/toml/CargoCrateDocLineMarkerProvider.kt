@@ -15,8 +15,20 @@ import org.rust.ide.icons.RsIcons
 import org.rust.ide.lineMarkers.RsLineMarkerInfoUtils
 import org.rust.lang.core.psi.ext.elementType
 import org.toml.lang.psi.*
+import java.net.URLEncoder
 
 class CargoCrateDocLineMarkerProvider : LineMarkerProvider {
+    companion object {
+        fun prepareDocsLink(name: String, version: String): String {
+            val urlVersion = when {
+                version.isEmpty() -> "*"
+                version.first().isDigit() -> "^${URLEncoder.encode(version)}"
+                else -> URLEncoder.encode(version)
+            }
+            return "https://docs.rs/$name/$urlVersion";
+        }
+    }
+
     override fun getLineMarkerInfo(element: PsiElement): LineMarkerInfo<*>? = null
 
     override fun collectSlowLineMarkers(elements: List<PsiElement>, result: MutableCollection<in LineMarkerInfo<*>>) {
@@ -47,19 +59,21 @@ class CargoCrateDocLineMarkerProvider : LineMarkerProvider {
     }
 
     private fun genLineMarkerInfo(anchor: PsiElement, name: String, version: String): LineMarkerInfo<PsiElement> {
-        val urlVersion = when {
+        val prettyVersion = when {
             version.isEmpty() -> "*"
             version.first().isDigit() -> "^${version}"
             else -> version
         }
 
+        val docsLink = prepareDocsLink(name, version);
+
         return RsLineMarkerInfoUtils.create(
             anchor,
             anchor.textRange,
             RsIcons.DOCS_MARK,
-            { _, _ -> BrowserUtil.browse("https://docs.rs/$name/$urlVersion") },
+            { _, _ -> BrowserUtil.browse(docsLink) },
             GutterIconRenderer.Alignment.LEFT
-        ) { "Open documentation for `$name@$urlVersion`" }
+        ) { "Open documentation for `$name@$prettyVersion`" }
     }
 }
 
